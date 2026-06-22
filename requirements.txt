@@ -1,0 +1,4 @@
+markitdown
+openpyxl
+pywin32
+pymupdf4llm
