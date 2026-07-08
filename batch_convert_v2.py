@@ -230,6 +230,12 @@ COM_FILE_FORMATS = {
 }
 
 
+def is_temporary_office_file(filename):
+    """Return True for Office lock/temp files that should not be converted."""
+    basename = os.path.basename(filename)
+    return basename.startswith("~$")
+
+
 def convert_old_format(src_path, src_ext, upgraded_dir, relative_path):
     """Convert legacy format file to modern format, save to upgraded dir, return new path.
     将旧格式文件转为新格式，保存到 upgraded 目录，返回新文件路径。
@@ -296,7 +302,7 @@ def convert_old_format(src_path, src_ext, upgraded_dir, relative_path):
 
 # ============ Custom PDF conversion / PDF 自定义转换 ============
 
-def pdf_to_markdown(file_path):
+def _pdf_to_markdown_legacy(file_path):
     """Convert PDF to Markdown using pymupdf4llm (preferred) or MarkItDown (fallback).
     将 PDF 转为 Markdown，优先使用 pymupdf4llm，失败时回退到 MarkItDown。
 
@@ -323,6 +329,116 @@ def pdf_to_markdown(file_path):
     md = MarkItDown()
     result = md.convert(file_path)
     return result.text_content, result.title or os.path.splitext(os.path.basename(file_path))[0]
+
+
+def _pdf_text_score(text):
+    """Score extracted PDF text by completeness and obvious encoding artifacts."""
+    if not text or not text.strip():
+        return -1
+
+    clean = text.strip()
+    private_use_chars = sum(0xE000 <= ord(ch) <= 0xF8FF for ch in clean)
+    replacement_chars = clean.count("\ufffd")
+    cid_tokens = len(re.findall(r"\(cid:\d+\)", clean))
+    cjk_chars = len(re.findall(r"[\u4e00-\u9fff]", clean))
+
+    return (
+        len(clean)
+        + cjk_chars
+        - private_use_chars * 30
+        - replacement_chars * 50
+        - cid_tokens * 50
+    )
+
+
+def _first_pdf_title(text, file_path):
+    fallback = os.path.splitext(os.path.basename(file_path))[0]
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.isdigit():
+            return stripped[:120]
+    return fallback
+
+
+def _extract_pdf_with_pdfplumber(file_path):
+    import pdfplumber
+
+    parts = []
+    with pdfplumber.open(file_path) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text(x_tolerance=1, y_tolerance=3) or ""
+            if text.strip():
+                parts.append(text.strip())
+
+    markdown = "\n\n".join(parts)
+    return markdown, _first_pdf_title(markdown, file_path)
+
+
+def _extract_pdf_with_pypdf(file_path):
+    import pypdf
+
+    reader = pypdf.PdfReader(file_path)
+    parts = []
+    for page in reader.pages:
+        text = page.extract_text() or ""
+        if text.strip():
+            parts.append(text.strip())
+
+    markdown = "\n\n".join(parts)
+    return markdown, _first_pdf_title(markdown, file_path)
+
+
+def _extract_pdf_with_pymupdf4llm(file_path):
+    import pymupdf4llm
+
+    markdown = pymupdf4llm.to_markdown(file_path) or ""
+    return markdown, _first_pdf_title(markdown, file_path)
+
+
+def _extract_pdf_with_markitdown(file_path):
+    from markitdown import MarkItDown
+
+    md = MarkItDown()
+    result = md.convert(file_path)
+    markdown = result.text_content or ""
+    title = result.title or _first_pdf_title(markdown, file_path)
+    return markdown, title
+
+
+def pdf_to_markdown(file_path):
+    """Convert PDF to Markdown using the best available extractor."""
+    extractors = [
+        ("pdfplumber", _extract_pdf_with_pdfplumber),
+        ("pypdf", _extract_pdf_with_pypdf),
+        ("pymupdf4llm", _extract_pdf_with_pymupdf4llm),
+        ("markitdown", _extract_pdf_with_markitdown),
+    ]
+
+    candidates = []
+    errors = []
+    for name, extractor in extractors:
+        try:
+            markdown, title = extractor(file_path)
+        except ImportError:
+            errors.append(f"{name} not installed")
+            continue
+        except Exception as e:
+            errors.append(f"{name}: {e}")
+            continue
+
+        score = _pdf_text_score(markdown)
+        if score >= 0:
+            candidates.append((score, name, markdown, title))
+
+    if candidates:
+        score, name, markdown, title = max(candidates, key=lambda item: item[0])
+        print(f"  [PDF extractor / PDF 提取器] {name}")
+        return markdown, title
+
+    if errors:
+        print("  [Warning/警告] PDF extraction failed: " + "; ".join(errors))
+
+    return "", os.path.splitext(os.path.basename(file_path))[0]
 
 
 def post_process_pdf(markdown):
@@ -498,6 +614,8 @@ def batch_convert():
     all_input_files = []
     for dirpath, dirnames, filenames in os.walk(input_dir):
         for filename in filenames:
+            if is_temporary_office_file(filename):
+                continue
             all_input_files.append(filename)
 
     if not all_input_files:
@@ -540,6 +658,8 @@ def batch_convert():
     old_files_found = False
     for dirpath, dirnames, filenames in os.walk(input_dir):
         for filename in filenames:
+            if is_temporary_office_file(filename):
+                continue
             file_ext = os.path.splitext(filename)[1].lower()
             if file_ext in old_extensions:
                 if not old_files_found:
@@ -591,6 +711,8 @@ def batch_convert():
     # Modern format files: read directly from input / 新格式文件：直接从 input 读取
     for dirpath, dirnames, filenames in os.walk(input_dir):
         for filename in filenames:
+            if is_temporary_office_file(filename):
+                continue
             file_ext = os.path.splitext(filename)[1].lower()
             if file_ext in new_extensions:
                 src_file_path = os.path.join(dirpath, filename)
@@ -684,6 +806,8 @@ def batch_convert():
     # Count skipped files / 统计跳过的文件
     for dirpath, dirnames, filenames in os.walk(input_dir):
         for filename in filenames:
+            if is_temporary_office_file(filename):
+                continue
             file_ext = os.path.splitext(filename)[1].lower()
             if file_ext not in valid_extensions:
                 log_data["skipped"].append(filename)

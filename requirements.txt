@@ -2,3 +2,5 @@ markitdown
 openpyxl
 pywin32
 pymupdf4llm
+pdfplumber
+pypdf

@@ -3,6 +3,12 @@ import sys
 import win32com.client
 
 
+def is_temporary_office_file(filename):
+    """Return True for Office lock/temp files that should not be converted."""
+    basename = os.path.basename(filename)
+    return basename.startswith("~$")
+
+
 def convert_old_formats(base_dir=None):
     """Batch upgrade all .doc/.xls files in a directory to .docx/.xlsx.
     将目录中所有 .doc/.xls 文件批量升级为 .docx/.xlsx。
@@ -31,6 +37,8 @@ def convert_old_formats(base_dir=None):
     # Walk through directories / 遍历文件夹
     for root, dirs, files in os.walk(base_dir):
         for filename in files:
+            if is_temporary_office_file(filename):
+                continue
             file_ext = os.path.splitext(filename)[1].lower()
             file_path = os.path.join(root, filename)
 
@@ -105,6 +113,8 @@ def convert_old_formats(base_dir=None):
     # 遍历文件夹
     for root, dirs, files in os.walk(base_dir):
         for filename in files:
+            if is_temporary_office_file(filename):
+                continue
             file_ext = os.path.splitext(filename)[1].lower()
             file_path = os.path.join(root, filename)
             
