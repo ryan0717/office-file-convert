@@ -1,6 +1,7 @@
 import os
 import re
 import datetime
+from collections import Counter, defaultdict
 from markitdown import MarkItDown
 
 
@@ -213,6 +214,342 @@ def xlsx_to_markdown(file_path):
     return "\n".join(md_parts).strip()
 
 
+# ============ Markdown helpers / Markdown 通用工具 ============
+
+def _normalize_text(text):
+    return re.sub(r"\s+", " ", (text or "").replace("\xa0", " ")).strip()
+
+
+def _escape_md_table_cell(text):
+    text = _normalize_text(text)
+    return text.replace("|", r"\|").replace("\n", "<br>")
+
+
+def _strip_empty_table_edges(rows):
+    normalized_rows = [
+        [_normalize_text(cell) for cell in row]
+        for row in rows
+        if row and any(_normalize_text(cell) for cell in row)
+    ]
+    if not normalized_rows:
+        return []
+
+    max_cols = max(len(row) for row in normalized_rows)
+    padded = [row + [""] * (max_cols - len(row)) for row in normalized_rows]
+    keep_cols = [
+        col_idx for col_idx in range(max_cols)
+        if any(row[col_idx] for row in padded)
+    ]
+    return [[row[col_idx] for col_idx in keep_cols] for row in padded]
+
+
+def _table_to_markdown(rows, max_table_cols=6):
+    rows = _strip_empty_table_edges(rows)
+    if not rows:
+        return ""
+
+    col_count = max(len(row) for row in rows)
+    rows = [row + [""] * (col_count - len(row)) for row in rows]
+
+    if col_count > max_table_cols:
+        parts = []
+        headers = rows[0]
+        data_rows = rows[1:] if len(rows) > 1 else rows
+        for row_idx, row in enumerate(data_rows, start=1):
+            meaningful = [
+                (headers[i] if i < len(headers) and headers[i] else f"列{i + 1}", row[i])
+                for i in range(col_count)
+                if row[i]
+            ]
+            if not meaningful:
+                continue
+            parts.append(f"**记录 {row_idx}**")
+            for key, value in meaningful:
+                parts.append(f"- **{_normalize_text(key)}**: {_normalize_text(value)}")
+            parts.append("")
+        return "\n".join(parts).strip()
+
+    header = [_escape_md_table_cell(cell) for cell in rows[0]]
+    body = rows[1:] if len(rows) > 1 else []
+    lines = [
+        "| " + " | ".join(header) + " |",
+        "| " + " | ".join("---" for _ in header) + " |",
+    ]
+    for row in body:
+        lines.append("| " + " | ".join(_escape_md_table_cell(cell) for cell in row) + " |")
+    return "\n".join(lines)
+
+
+# ============ Custom DOCX conversion / DOCX 结构化转换 ============
+
+def _docx_iter_block_items(document):
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+    from docx.oxml.table import CT_Tbl
+    from docx.oxml.text.paragraph import CT_P
+
+    body = document.element.body
+    for child in body.iterchildren():
+        if isinstance(child, CT_P):
+            yield Paragraph(child, document)
+        elif isinstance(child, CT_Tbl):
+            yield Table(child, document)
+
+
+def _docx_style_name(obj):
+    try:
+        return obj.style.name or ""
+    except Exception:
+        return ""
+
+
+def _docx_heading_level(paragraph):
+    style = _docx_style_name(paragraph).strip()
+    match = re.search(r"(?:Heading|标题)\s*([1-6])", style, flags=re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _docx_is_toc_paragraph(paragraph):
+    style = _docx_style_name(paragraph).lower()
+    if "toc" in style or "目录" in style:
+        return True
+    xml = paragraph._p.xml
+    return "TOC " in xml or "TOC\\" in xml or "w:instrText" in xml and "TOC" in xml
+
+
+def _docx_num_definitions(document):
+    from docx.oxml.ns import qn
+
+    definitions = {}
+    try:
+        numbering = document.part.numbering_part.element
+    except Exception:
+        return definitions
+
+    abstract_map = {}
+    for abstract in numbering.findall(qn("w:abstractNum")):
+        abstract_id = abstract.get(qn("w:abstractNumId"))
+        levels = {}
+        for lvl in abstract.findall(qn("w:lvl")):
+            ilvl = int(lvl.get(qn("w:ilvl"), "0"))
+            fmt_el = lvl.find(qn("w:numFmt"))
+            levels[ilvl] = fmt_el.get(qn("w:val")) if fmt_el is not None else "decimal"
+        abstract_map[abstract_id] = levels
+
+    for num in numbering.findall(qn("w:num")):
+        num_id = num.get(qn("w:numId"))
+        abstract_el = num.find(qn("w:abstractNumId"))
+        if abstract_el is None:
+            continue
+        definitions[num_id] = abstract_map.get(abstract_el.get(qn("w:val")), {})
+
+    return definitions
+
+
+def _docx_paragraph_num_info(paragraph, num_definitions):
+    from docx.oxml.ns import qn
+
+    num_pr = None
+    if paragraph._p.pPr is not None:
+        num_pr = paragraph._p.pPr.numPr
+    if num_pr is None and paragraph.style is not None and paragraph.style._element.pPr is not None:
+        num_pr = paragraph.style._element.pPr.numPr
+    if num_pr is not None and num_pr.numId is not None:
+        num_id = num_pr.numId.val
+        ilvl = int(num_pr.ilvl.val) if num_pr.ilvl is not None else 0
+        fmt = num_definitions.get(str(num_id), {}).get(ilvl, "decimal")
+        return str(num_id), ilvl, fmt
+
+    style = _docx_style_name(paragraph).lower()
+    if "list bullet" in style or "项目符号" in style:
+        return f"style:{style}", 0, "bullet"
+    if "list number" in style or "编号" in style:
+        return f"style:{style}", 0, "decimal"
+    return None
+
+
+def _docx_local_name(element):
+    return element.tag.rsplit("}", 1)[-1]
+
+
+def _docx_run_text_and_flags(run_element):
+    from docx.oxml.ns import qn
+
+    pieces = []
+    for child in run_element.iterchildren():
+        name = _docx_local_name(child)
+        if name == "t":
+            pieces.append(child.text or "")
+        elif name == "tab":
+            pieces.append("\t")
+        elif name in ("br", "cr"):
+            pieces.append("\n")
+
+    text = "".join(pieces)
+    rpr = run_element.find(qn("w:rPr"))
+    if rpr is None:
+        return text, False, False, False
+
+    def enabled(tag):
+        el = rpr.find(qn(f"w:{tag}"))
+        if el is None:
+            return False
+        value = el.get(qn("w:val"))
+        return value not in ("0", "false", "False", "none")
+
+    return text, enabled("b"), enabled("i"), rpr.find(qn("w:u")) is not None
+
+
+def _apply_inline_markdown(text, bold=False, italic=False, underline=False):
+    if not text:
+        return ""
+    result = text
+    if bold and italic:
+        result = f"***{result}***"
+    elif bold:
+        result = f"**{result}**"
+    elif italic:
+        result = f"*{result}*"
+    if underline:
+        result = f"<u>{result}</u>"
+    return result
+
+
+def _docx_paragraph_to_markdown(paragraph):
+    from docx.oxml.ns import qn
+
+    parts = []
+    for child in paragraph._p.iterchildren():
+        name = _docx_local_name(child)
+        if name == "r":
+            text, bold, italic, underline = _docx_run_text_and_flags(child)
+            parts.append(_apply_inline_markdown(text, bold, italic, underline))
+        elif name == "hyperlink":
+            rid = child.get(qn("r:id"))
+            href = None
+            if rid and rid in paragraph.part.rels:
+                href = paragraph.part.rels[rid].target_ref
+            link_text = []
+            for run in child.iterchildren():
+                if _docx_local_name(run) == "r":
+                    text, bold, italic, underline = _docx_run_text_and_flags(run)
+                    link_text.append(_apply_inline_markdown(text, bold, italic, underline))
+            label = "".join(link_text)
+            parts.append(f"[{label}]({href})" if href and label else label)
+
+    text = "".join(parts)
+    return re.sub(r"[ \t]+\n", "\n", text).strip()
+
+
+def _docx_table_to_markdown(table):
+    rows = []
+    for row in table.rows:
+        cells = []
+        for cell in row.cells:
+            paras = [_docx_paragraph_to_markdown(p) for p in cell.paragraphs]
+            cells.append("<br>".join(p for p in paras if p))
+        rows.append(cells)
+    return _table_to_markdown(rows)
+
+
+def _docx_section_text(section_part):
+    items = []
+    for paragraph in section_part.paragraphs:
+        text = _normalize_text(paragraph.text)
+        if text:
+            items.append(text)
+    for table in section_part.tables:
+        text = _normalize_text(" ".join(cell.text for row in table.rows for cell in row.cells))
+        if text:
+            items.append(text)
+    return items
+
+
+def _docx_header_footer_markdown(document, body_text):
+    seen = set()
+    items = []
+    for section in document.sections:
+        for part in (section.header, section.footer):
+            for text in _docx_section_text(part):
+                key = _normalize_text(text)
+                if not key or key in seen or key in body_text:
+                    continue
+                seen.add(key)
+                items.append(key)
+    if not items:
+        return ""
+    lines = ["## 文档元信息", ""]
+    lines.extend(f"- {item}" for item in items)
+    return "\n".join(lines)
+
+
+def docx_to_markdown(file_path):
+    """Convert DOCX to structured Markdown using styles, lists, tables, and metadata."""
+    from docx import Document
+
+    document = Document(file_path)
+    num_definitions = _docx_num_definitions(document)
+    counters = defaultdict(lambda: defaultdict(int))
+    parts = []
+    body_plain_parts = []
+
+    for block in _docx_iter_block_items(document):
+        if hasattr(block, "rows"):
+            table_md = _docx_table_to_markdown(block)
+            if table_md:
+                parts.append(table_md)
+                body_plain_parts.append(re.sub(r"[*_`#|\-<>]", "", table_md))
+            continue
+
+        paragraph = block
+        if _docx_is_toc_paragraph(paragraph):
+            continue
+        text = _docx_paragraph_to_markdown(paragraph)
+        if not text:
+            continue
+
+        heading_level = _docx_heading_level(paragraph)
+        num_info = _docx_paragraph_num_info(paragraph, num_definitions)
+        if heading_level:
+            if num_info and num_info[2] != "bullet":
+                num_id, ilvl, _fmt = num_info
+                counters[num_id][ilvl] += 1
+                for deeper in list(counters[num_id]):
+                    if deeper > ilvl:
+                        counters[num_id][deeper] = 0
+                path = ".".join(
+                    str(counters[num_id][level])
+                    for level in range(ilvl + 1)
+                    if counters[num_id][level]
+                )
+                if path and not text.startswith(path):
+                    text = f"{path} {text}"
+            parts.append(f"{'#' * heading_level} {text}")
+        elif num_info:
+            num_id, ilvl, fmt = num_info
+            indent = "  " * ilvl
+            if fmt in ("bullet", "none"):
+                parts.append(f"{indent}- {text}")
+            else:
+                counters[num_id][ilvl] += 1
+                for deeper in list(counters[num_id]):
+                    if deeper > ilvl:
+                        counters[num_id][deeper] = 0
+                parts.append(f"{indent}{counters[num_id][ilvl]}. {text}")
+        else:
+            parts.append(text)
+        body_plain_parts.append(_normalize_text(paragraph.text))
+
+    body_text = "\n".join(body_plain_parts)
+    metadata = _docx_header_footer_markdown(document, body_text)
+    if metadata:
+        parts.insert(0, metadata)
+
+    return "\n\n".join(part for part in parts if part).strip()
+
+
 # ============ Legacy format conversion (.doc/.xls/.ppt -> modern) / 旧格式转换 ============
 
 # Legacy -> modern format mapping / 旧格式 → 新格式的映射
@@ -355,13 +692,247 @@ def _first_pdf_title(text, file_path):
     fallback = os.path.splitext(os.path.basename(file_path))[0]
     for line in text.splitlines():
         stripped = line.strip()
-        if stripped and not stripped.isdigit():
+        if stripped and not stripped.isdigit() and not stripped.startswith("<!-- page:"):
+            stripped = stripped.lstrip("#").strip()
             return stripped[:120]
     return fallback
 
 
+def _bbox_overlaps(a, b):
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    return ax0 < bx1 and ax1 > bx0 and ay0 < by1 and ay1 > by0
+
+
+def _pdf_page_lines(page):
+    try:
+        words = page.extract_words(extra_attrs=["size"], use_text_flow=False) or []
+    except TypeError:
+        words = page.extract_words(use_text_flow=False) or []
+    if not words:
+        return []
+
+    groups = []
+    for word in sorted(words, key=lambda item: (item["top"], item["x0"])):
+        placed = False
+        for group in groups:
+            if abs(group["top"] - word["top"]) <= 3:
+                group["words"].append(word)
+                group["top"] = min(group["top"], word["top"])
+                group["bottom"] = max(group["bottom"], word["bottom"])
+                group["x0"] = min(group["x0"], word["x0"])
+                group["x1"] = max(group["x1"], word["x1"])
+                placed = True
+                break
+        if not placed:
+            groups.append({
+                "top": word["top"],
+                "bottom": word["bottom"],
+                "x0": word["x0"],
+                "x1": word["x1"],
+                "words": [word],
+            })
+
+    lines = []
+    for group in groups:
+        group["words"].sort(key=lambda item: item["x0"])
+        sizes = [float(word.get("size", 0) or 0) for word in group["words"]]
+        text = _normalize_text(" ".join(word["text"] for word in group["words"]))
+        if text:
+            lines.append({
+                "type": "line",
+                "text": text,
+                "top": group["top"],
+                "bottom": group["bottom"],
+                "x0": group["x0"],
+                "x1": group["x1"],
+                "size": max(sizes) if sizes else 0,
+                "page_width": page.width,
+                "page_height": page.height,
+            })
+    return lines
+
+
+def _pdf_repeated_margin_texts(page_lines):
+    counter = Counter()
+    for lines in page_lines:
+        for line in lines:
+            text = _normalize_text(line["text"])
+            if not text:
+                continue
+            height = line["page_height"]
+            if line["top"] <= height * 0.10 or line["bottom"] >= height * 0.90:
+                counter[text] += 1
+
+    repeated = {
+        text for text, count in counter.items()
+        if count > 1 and len(text) <= 160
+    }
+    return repeated
+
+
+def _pdf_is_page_noise(line, repeated_margin_texts):
+    text = _normalize_text(line["text"])
+    if not text:
+        return True
+    if text in repeated_margin_texts:
+        return True
+    if re.fullmatch(r"[-—–]?\s*\d{1,4}\s*[-—–]?", text):
+        return True
+    return False
+
+
+def _pdf_heading_level(line, median_size):
+    text = line["text"]
+    if len(text) > 120:
+        return None
+    numbered = re.match(r"^(\d+(?:\.\d+){0,5})[、.\s]+.+", text)
+    if numbered:
+        return min(numbered.group(1).count(".") + 2, 6)
+    if re.match(r"^[一二三四五六七八九十]+[、.．]\s*\S+", text):
+        return 2
+
+    center = abs(((line["x0"] + line["x1"]) / 2) - (line["page_width"] / 2))
+    if median_size and line["size"] >= median_size + 3 and center < line["page_width"] * 0.25:
+        return 1
+    if median_size and line["size"] >= median_size + 1.5 and center < line["page_width"] * 0.35:
+        return 2
+    return None
+
+
+def _pdf_extract_table_blocks(page):
+    blocks = []
+    try:
+        tables = page.find_tables()
+    except Exception:
+        return blocks
+
+    for table in tables:
+        rows = table.extract() or []
+        rows = _strip_empty_table_edges(rows)
+        if not rows:
+            continue
+        blocks.append({
+            "type": "table",
+            "top": table.bbox[1],
+            "bottom": table.bbox[3],
+            "bbox": table.bbox,
+            "rows": rows,
+        })
+    return blocks
+
+
+def _pdf_merge_table_blocks(blocks):
+    merged = []
+    for block in blocks:
+        if block["type"] != "table":
+            merged.append(block)
+            continue
+
+        last_content_idx = None
+        for idx in range(len(merged) - 1, -1, -1):
+            if merged[idx]["type"] != "page":
+                last_content_idx = idx
+                break
+
+        if (
+            last_content_idx is not None
+            and merged[last_content_idx]["type"] == "table"
+            and merged[last_content_idx]["rows"] and block["rows"]
+            and [_normalize_text(c) for c in merged[last_content_idx]["rows"][0]]
+            == [_normalize_text(c) for c in block["rows"][0]]
+        ):
+            merged[last_content_idx]["rows"].extend(block["rows"][1:])
+        else:
+            merged.append(block)
+    return merged
+
+
+def _extract_pdf_with_pdfplumber_structured(file_path):
+    import pdfplumber
+
+    page_blocks = []
+    page_lines = []
+    with pdfplumber.open(file_path) as pdf:
+        for page_number, page in enumerate(pdf.pages, start=1):
+            lines = _pdf_page_lines(page)
+            page_lines.append(lines)
+            table_blocks = _pdf_extract_table_blocks(page)
+            table_bboxes = [block["bbox"] for block in table_blocks]
+            body_lines = [
+                line for line in lines
+                if not any(
+                    _bbox_overlaps(
+                        (line["x0"], line["top"], line["x1"], line["bottom"]),
+                        bbox,
+                    )
+                    for bbox in table_bboxes
+                )
+            ]
+            page_blocks.append((page_number, page, body_lines, table_blocks))
+
+    repeated = _pdf_repeated_margin_texts(page_lines)
+    all_sizes = [
+        line["size"] for lines in page_lines for line in lines
+        if line["size"] and not _pdf_is_page_noise(line, repeated)
+    ]
+    median_size = sorted(all_sizes)[len(all_sizes) // 2] if all_sizes else 0
+
+    blocks = []
+    for page_number, _page, lines, table_blocks in page_blocks:
+        page_content = []
+        for line in lines:
+            if _pdf_is_page_noise(line, repeated):
+                continue
+            level = _pdf_heading_level(line, median_size)
+            page_content.append({
+                "type": "heading" if level else "paragraph",
+                "level": level,
+                "text": line["text"],
+                "top": line["top"],
+            })
+        page_content.extend(table_blocks)
+        page_content.sort(key=lambda item: item["top"])
+        if page_content:
+            blocks.append({"type": "page", "page": page_number})
+            blocks.extend(page_content)
+
+    blocks = _pdf_merge_table_blocks(blocks)
+    parts = []
+    paragraph_buffer = []
+
+    def flush_paragraph():
+        if paragraph_buffer:
+            parts.append(" ".join(paragraph_buffer).strip())
+            paragraph_buffer.clear()
+
+    for block in blocks:
+        block_type = block["type"]
+        if block_type == "page":
+            flush_paragraph()
+            parts.append(f"<!-- page: {block['page']} -->")
+        elif block_type == "heading":
+            flush_paragraph()
+            parts.append(f"{'#' * block['level']} {block['text']}")
+        elif block_type == "table":
+            flush_paragraph()
+            table_md = _table_to_markdown(block["rows"])
+            if table_md:
+                parts.append(table_md)
+        else:
+            paragraph_buffer.append(block["text"])
+    flush_paragraph()
+
+    markdown = "\n\n".join(part for part in parts if part).strip()
+    return markdown, _first_pdf_title(markdown, file_path)
+
+
 def _extract_pdf_with_pdfplumber(file_path):
     import pdfplumber
+
+    structured, title = _extract_pdf_with_pdfplumber_structured(file_path)
+    if _pdf_text_score(structured) > 0:
+        return structured, title
 
     parts = []
     with pdfplumber.open(file_path) as pdf:
@@ -407,8 +978,17 @@ def _extract_pdf_with_markitdown(file_path):
 
 def pdf_to_markdown(file_path):
     """Convert PDF to Markdown using the best available extractor."""
+    try:
+        markdown, title = _extract_pdf_with_pdfplumber(file_path)
+        if _pdf_text_score(markdown) >= 0:
+            print("  [PDF extractor / PDF 提取器] pdfplumber")
+            return markdown, title
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"  [Warning/警告] pdfplumber failed ({e}), falling back")
+
     extractors = [
-        ("pdfplumber", _extract_pdf_with_pdfplumber),
         ("pypdf", _extract_pdf_with_pypdf),
         ("pymupdf4llm", _extract_pdf_with_pymupdf4llm),
         ("markitdown", _extract_pdf_with_markitdown),
@@ -757,12 +1337,9 @@ def batch_convert():
                 title = os.path.splitext(filename)[0]
 
             elif file_ext == ".docx":
-                # DOCX: MarkItDown + custom style_map (CN/EN heading mapping) / 中英文标题映射
-                result = md.convert(
-                    src_file_path, style_map=DOCX_STYLE_MAP
-                )
-                markdown = result.text_content
-                title = result.title or os.path.splitext(filename)[0]
+                # DOCX: structured converter / 结构化转换器
+                markdown = docx_to_markdown(src_file_path)
+                title = os.path.splitext(filename)[0]
 
             elif file_ext == ".pptx":
                 # PPTX: MarkItDown + fix slide numbering / 修复幻灯片编号
