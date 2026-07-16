@@ -417,7 +417,7 @@ def _apply_inline_markdown(text, bold=False, italic=False, underline=False):
     return result
 
 
-def _docx_paragraph_to_markdown(paragraph):
+def _docx_paragraph_to_markdown(paragraph, emit_underline=True):
     from docx.oxml.ns import qn
 
     parts = []
@@ -425,6 +425,8 @@ def _docx_paragraph_to_markdown(paragraph):
         name = _docx_local_name(child)
         if name == "r":
             text, bold, italic, underline = _docx_run_text_and_flags(child)
+            if not emit_underline:
+                underline = False
             parts.append(_apply_inline_markdown(text, bold, italic, underline))
         elif name == "hyperlink":
             rid = child.get(qn("r:id"))
@@ -435,6 +437,8 @@ def _docx_paragraph_to_markdown(paragraph):
             for run in child.iterchildren():
                 if _docx_local_name(run) == "r":
                     text, bold, italic, underline = _docx_run_text_and_flags(run)
+                    if not emit_underline:
+                        underline = False
                     link_text.append(_apply_inline_markdown(text, bold, italic, underline))
             label = "".join(link_text)
             parts.append(f"[{label}]({href})" if href and label else label)
@@ -448,7 +452,9 @@ def _docx_table_to_markdown(table):
     for row in table.rows:
         cells = []
         for cell in row.cells:
-            paras = [_docx_paragraph_to_markdown(p) for p in cell.paragraphs]
+            # 表格内跳过 underline 输出：DOCX 表格样式经常通过样式继承给所有单元格
+            # 加上 <w:u> 属性，转成 Markdown 会产生大量 <u> 噪声且 <u> 非标准 Markdown 语法。
+            paras = [_docx_paragraph_to_markdown(p, emit_underline=False) for p in cell.paragraphs]
             cells.append("<br>".join(p for p in paras if p))
         rows.append(cells)
     return _table_to_markdown(rows)
