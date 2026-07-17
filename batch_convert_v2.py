@@ -498,14 +498,16 @@ def docx_to_markdown(file_path):
     document = Document(file_path)
     num_definitions = _docx_num_definitions(document)
     counters = defaultdict(lambda: defaultdict(int))
-    parts = []
+    # 每个 item 是 (type, text)，type 决定拼接时的间距
+    # type ∈ {"heading", "paragraph", "list", "block"}
+    items = []
     body_plain_parts = []
 
     for block in _docx_iter_block_items(document):
         if hasattr(block, "rows"):
             table_md = _docx_table_to_markdown(block)
             if table_md:
-                parts.append(table_md)
+                items.append(("block", table_md))
                 body_plain_parts.append(re.sub(r"[*_`#|\-<>]", "", table_md))
             continue
 
@@ -532,28 +534,43 @@ def docx_to_markdown(file_path):
                 )
                 if path and not text.startswith(path):
                     text = f"{path} {text}"
-            parts.append(f"{'#' * heading_level} {text}")
+            items.append(("heading", f"{'#' * heading_level} {text}"))
         elif num_info:
             num_id, ilvl, fmt = num_info
             indent = "  " * ilvl
             if fmt in ("bullet", "none"):
-                parts.append(f"{indent}- {text}")
+                items.append(("list", f"{indent}- {text}"))
             else:
                 counters[num_id][ilvl] += 1
                 for deeper in list(counters[num_id]):
                     if deeper > ilvl:
                         counters[num_id][deeper] = 0
-                parts.append(f"{indent}{counters[num_id][ilvl]}. {text}")
+                items.append(("list", f"{indent}{counters[num_id][ilvl]}. {text}"))
         else:
-            parts.append(text)
+            items.append(("paragraph", text))
         body_plain_parts.append(_normalize_text(paragraph.text))
 
     body_text = "\n".join(body_plain_parts)
     metadata = _docx_header_footer_markdown(document, body_text)
     if metadata:
-        parts.insert(0, metadata)
+        items.insert(0, ("block", metadata))
 
-    return "\n\n".join(part for part in parts if part).strip()
+    # 拼接策略：相邻 list 之间用单换行（tight list，避免列表项之间多余空行），
+    # 其他相邻块之间用双换行（段落/标题/表格之间需要空行才能正确渲染）。
+    parts = []
+    prev_type = None
+    for item_type, text in items:
+        if not text:
+            continue
+        if parts:
+            if prev_type == "list" and item_type == "list":
+                parts.append("\n")
+            else:
+                parts.append("\n\n")
+        parts.append(text)
+        prev_type = item_type
+
+    return "".join(parts).strip()
 
 
 # ============ Legacy format conversion (.doc/.xls/.ppt -> modern) / 旧格式转换 ============
