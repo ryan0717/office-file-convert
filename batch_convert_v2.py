@@ -727,11 +727,11 @@ def _bbox_overlaps(a, b):
     return ax0 < bx1 and ax1 > bx0 and ay0 < by1 and ay1 > by0
 
 
-def _pdf_page_lines(page):
-    try:
-        words = page.extract_words(extra_attrs=["size"], use_text_flow=False) or []
-    except TypeError:
-        words = page.extract_words(use_text_flow=False) or []
+def _group_words_into_lines(words, page):
+    """给定 words 列表，按 (top, x0) 排序并以 3px 阈值聚合同行，返回 line dict 列表。
+
+    _pdf_page_lines 与 _pdf_page_lines_columnar 共用此核心聚字逻辑。
+    """
     if not words:
         return []
 
@@ -774,6 +774,104 @@ def _pdf_page_lines(page):
                 "page_height": page.height,
             })
     return lines
+
+
+def _pdf_page_lines(page):
+    try:
+        words = page.extract_words(extra_attrs=["size"], use_text_flow=False) or []
+    except TypeError:
+        words = page.extract_words(use_text_flow=False) or []
+    return _group_words_into_lines(words, page)
+
+
+def _pdf_detect_columns(page, words):
+    """检测页面栏布局，返回栏 x 范围列表 [(x0, x1), ...]。单栏返回 [(0, page_width)]。
+
+    算法：将 word 的 [x0, x1] 投影到 x 轴构建墨迹密度直方图，
+    在页面中部区间 (15%~85% 页宽) 扫描最大连续空白带 (gutter)，
+    若 gutter 宽度 ≥ 5% 页宽则判定为多栏。
+    """
+    page_width = float(page.width)
+    if not words:
+        return [(0.0, page_width)]
+
+    bin_width = 2.0
+    num_bins = int(page_width / bin_width) + 1
+    ink = [0] * num_bins
+    for word in words:
+        start = max(0, int(float(word["x0"]) / bin_width))
+        end = min(num_bins, int(float(word["x1"]) / bin_width) + 1)
+        for i in range(start, end):
+            ink[i] += 1
+
+    # 仅在页面中部区间扫描 gutter，避免把左右页边距误判为栏分隔
+    scan_start = int(page_width * 0.15 / bin_width)
+    scan_end = int(page_width * 0.85 / bin_width)
+    min_gutter_bins = max(1, int(page_width * 0.05 / bin_width))  # 最小 gutter 宽度 5% 页宽
+
+    best_gutter_start = None
+    best_gutter_len = 0
+    cur_start = None
+    cur_len = 0
+    for i in range(scan_start, scan_end):
+        if ink[i] == 0:
+            if cur_start is None:
+                cur_start = i
+                cur_len = 0
+            cur_len += 1
+            if cur_len > best_gutter_len:
+                best_gutter_len = cur_len
+                best_gutter_start = cur_start
+        else:
+            cur_start = None
+            cur_len = 0
+
+    if best_gutter_start is None or best_gutter_len < min_gutter_bins:
+        return [(0.0, page_width)]
+
+    gutter_x0 = best_gutter_start * bin_width
+    gutter_x1 = (best_gutter_start + best_gutter_len) * bin_width
+
+    # 验证 gutter 两侧均有实质内容，避免把右侧页边距误判为栏分隔
+    left_words = sum(1 for w in words if float(w["x1"]) <= gutter_x0)
+    right_words = sum(1 for w in words if float(w["x0"]) >= gutter_x1)
+    min_side_words = max(3, len(words) // 10)
+    if left_words < min_side_words or right_words < min_side_words:
+        return [(0.0, page_width)]
+
+    return [(0.0, gutter_x0), (gutter_x1, page_width)]
+
+
+def _pdf_page_lines_columnar(page):
+    """按栏聚字。单栏时退化为 _pdf_page_lines；多栏时按左→右栏顺序拼接各行。
+
+    单栏场景直接复用 _group_words_into_lines，行为与 _pdf_page_lines 字节级一致；
+    多栏场景对每栏分别聚字，再按栏从左到右拼接，避免左右栏文本交错。
+    """
+    try:
+        words = page.extract_words(extra_attrs=["size"], use_text_flow=False) or []
+    except TypeError:
+        words = page.extract_words(use_text_flow=False) or []
+
+    columns = _pdf_detect_columns(page, words)
+    if len(columns) <= 1:
+        return _group_words_into_lines(words, page)
+
+    all_lines = []
+    page_height = float(page.height)
+    for col_idx, (col_x0, col_x1) in enumerate(columns):
+        col_words = [
+            w for w in words
+            if float(w["x0"]) >= col_x0 and float(w["x1"]) <= col_x1
+        ]
+        col_lines = _group_words_into_lines(col_words, page)
+        # 为保持栏内阅读顺序，右栏的排序键加上 col_idx * page_height 偏移，
+        # 避免后续 sort(top) 把左右栏同行重新交错（_sort_key 仅用于排序，
+        # top/bottom 仍保留原值供页眉页脚检测与表格 bbox 过滤使用）
+        for line in col_lines:
+            line["_sort_key"] = col_idx * page_height + line["top"]
+        all_lines.extend(col_lines)
+    return all_lines
 
 
 def _pdf_repeated_margin_texts(page_lines):
@@ -871,14 +969,20 @@ def _pdf_merge_table_blocks(blocks):
     return merged
 
 
-def _extract_pdf_with_pdfplumber_structured(file_path):
+def _extract_pdf_structured(file_path, line_extractor):
+    """PDF 结构化提取通用主流程。
+
+    line_extractor(page) -> lines 列表，决定逐行还是按栏聚字。
+    逐行模式传入 _pdf_page_lines，按栏模式传入 _pdf_page_lines_columnar。
+    其余表格剔除、页眉页脚过滤、标题判定、block 组装、分页注释逻辑完全一致。
+    """
     import pdfplumber
 
     page_blocks = []
     page_lines = []
     with pdfplumber.open(file_path) as pdf:
         for page_number, page in enumerate(pdf.pages, start=1):
-            lines = _pdf_page_lines(page)
+            lines = line_extractor(page)
             page_lines.append(lines)
             table_blocks = _pdf_extract_table_blocks(page)
             table_bboxes = [block["bbox"] for block in table_blocks]
@@ -913,9 +1017,11 @@ def _extract_pdf_with_pdfplumber_structured(file_path):
                 "level": level,
                 "text": line["text"],
                 "top": line["top"],
+                "_sort_key": line.get("_sort_key", line["top"]),
             })
         page_content.extend(table_blocks)
-        page_content.sort(key=lambda item: item["top"])
+        # 按栏模式下行带 _sort_key（右栏已偏移 page_height），逐行模式无此键回退到 top
+        page_content.sort(key=lambda item: item.get("_sort_key", item["top"]))
         if page_content:
             blocks.append({"type": "page", "page": page_number})
             blocks.extend(page_content)
@@ -948,6 +1054,20 @@ def _extract_pdf_with_pdfplumber_structured(file_path):
 
     markdown = "\n\n".join(part for part in parts if part).strip()
     return markdown, _first_pdf_title(markdown, file_path)
+
+
+def _extract_pdf_with_pdfplumber_structured(file_path):
+    """逐行（自上而下）结构化提取，保持原有行为。"""
+    return _extract_pdf_structured(file_path, _pdf_page_lines)
+
+
+def _extract_pdf_with_pdfplumber_columnar(file_path):
+    """按栏结构化提取：先分栏，再按栏自上而下提取。
+
+    输出结构与 _extract_pdf_with_pdfplumber_structured 一致（相同 block 类型、
+    分页注释、标题层级），仅文本顺序按栏重组。单栏页面自动退化为逐行模式。
+    """
+    return _extract_pdf_structured(file_path, _pdf_page_lines_columnar)
 
 
 def _extract_pdf_with_pdfplumber(file_path):
@@ -999,13 +1119,50 @@ def _extract_pdf_with_markitdown(file_path):
     return markdown, title
 
 
-def pdf_to_markdown(file_path):
-    """Convert PDF to Markdown using the best available extractor."""
+def _pdf_detect_layout_mode(file_path):
+    """采样前几页检测是否多栏布局，返回 'column' 或 'linear'。
+
+    用于 auto 模式：任意采样页检测到多栏即走按栏提取，否则回退逐行。
+    """
     try:
-        markdown, title = _extract_pdf_with_pdfplumber(file_path)
-        if _pdf_text_score(markdown) >= 0:
-            print("  [PDF extractor / PDF 提取器] pdfplumber")
-            return markdown, title
+        import pdfplumber
+    except ImportError:
+        return "linear"
+    try:
+        with pdfplumber.open(file_path) as pdf:
+            for page in pdf.pages[:3]:
+                try:
+                    words = page.extract_words(extra_attrs=["size"], use_text_flow=False) or []
+                except TypeError:
+                    words = page.extract_words(use_text_flow=False) or []
+                if len(_pdf_detect_columns(page, words)) > 1:
+                    return "column"
+    except Exception:
+        pass
+    return "linear"
+
+
+def pdf_to_markdown(file_path, extract_mode="linear"):
+    """Convert PDF to Markdown using the best available extractor.
+
+    extract_mode: 'linear'（默认，逐行自上而下）| 'column'（按栏提取）
+                  | 'auto'（采样检测，多栏走 column，单栏回退 linear）
+    """
+    # auto 模式：采样前几页检测是否多栏布局
+    if extract_mode == "auto":
+        extract_mode = _pdf_detect_layout_mode(file_path)
+
+    try:
+        if extract_mode == "column":
+            markdown, title = _extract_pdf_with_pdfplumber_columnar(file_path)
+            if _pdf_text_score(markdown) >= 0:
+                print("  [PDF extractor / PDF 提取器] pdfplumber (columnar/按栏)")
+                return markdown, title
+        else:
+            markdown, title = _extract_pdf_with_pdfplumber(file_path)
+            if _pdf_text_score(markdown) >= 0:
+                print("  [PDF extractor / PDF 提取器] pdfplumber")
+                return markdown, title
     except ImportError:
         pass
     except Exception as e:
@@ -1183,6 +1340,8 @@ def batch_convert():
     input_dir = os.path.join(base_dir, "input")
     output_dir = os.path.join(base_dir, "output")
     upgraded_dir = os.path.join(base_dir, "upgraded")
+    # Logs directory / 日志目录：每次转换生成的日志统一放这里
+    log_dir = os.path.join(base_dir, "logs")
 
     # Modern formats for direct conversion / 支持直接转换的新格式
     new_extensions = ('.pptx', '.docx', '.xlsx', '.pdf')
@@ -1190,6 +1349,10 @@ def batch_convert():
     old_extensions = tuple(OLD_FORMAT_MAP.keys())
     # All supported formats / 所有可处理的格式
     valid_extensions = new_extensions + old_extensions
+
+    # PDF 提取模式 / PDF extraction mode:
+    #   'linear'（默认，原逐行自上而下）| 'column'（先分栏再按栏提取）| 'auto'（自动检测，单栏回退 linear）
+    pdf_extract_mode = "linear"
     # ===========================================
 
     # ---- Startup banner / 启动横幅 ----
@@ -1212,6 +1375,7 @@ def batch_convert():
     os.makedirs(input_dir, exist_ok=True)
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(upgraded_dir, exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
 
     # ---- Scan input files / 扫描输入文件 ----
     all_input_files = []
@@ -1416,7 +1580,7 @@ def batch_convert():
     log_filename = (
         "convert_log_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + ".txt"
     )
-    log_file_path = os.path.join(base_dir, log_filename)
+    log_file_path = os.path.join(log_dir, log_filename)
 
     with open(log_file_path, "w", encoding="utf-8") as f:
         f.write("=" * 50 + "\n")

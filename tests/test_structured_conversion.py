@@ -124,6 +124,65 @@ class StructuredPdfTests(unittest.TestCase):
 
         self.assertTrue(markdown.strip())
 
+    def _make_two_column_pdf(self, path):
+        try:
+            import fitz
+        except ImportError:
+            self.skipTest("PyMuPDF is not installed")
+
+        doc = fitz.open()
+        page = doc.new_page(width=595, height=842)
+        # 左栏 x=72，右栏 x=320，中部留出明显空白带作为栏分隔（gutter 宽约 170px > 5% 页宽）
+        # 同一 top 上左右栏各有文本，逐行模式会把它们合并成一行
+        left_lines = [("Left alpha", 150), ("Left beta", 180), ("Left gamma", 210)]
+        right_lines = [("Right alpha", 150), ("Right beta", 180), ("Right gamma", 210)]
+        for text, y in left_lines:
+            page.insert_text((72, y), text, fontsize=11)
+        for text, y in right_lines:
+            page.insert_text((320, y), text, fontsize=11)
+        doc.save(path)
+
+    def test_column_mode_degrades_to_linear_for_single_column(self):
+        """单栏 PDF：按栏模式输出应与逐行模式完全一致（自动退化为逐行）。"""
+        try:
+            import pdfplumber  # noqa: F401
+        except ImportError:
+            self.skipTest("pdfplumber is not installed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sample.pdf"
+            self._make_pdf(path)
+            linear_md, _ = converter._extract_pdf_with_pdfplumber_structured(str(path))
+            column_md, _ = converter._extract_pdf_with_pdfplumber_columnar(str(path))
+
+        self.assertEqual(linear_md, column_md)
+
+    def test_column_mode_extracts_left_column_before_right(self):
+        """双栏 PDF：按栏模式应先提取完整左栏，再提取右栏，不与逐行模式那样左右交错。"""
+        try:
+            import pdfplumber  # noqa: F401
+        except ImportError:
+            self.skipTest("pdfplumber is not installed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "twocol.pdf"
+            self._make_two_column_pdf(path)
+            linear_md, _ = converter._extract_pdf_with_pdfplumber_structured(str(path))
+            column_md, _ = converter._extract_pdf_with_pdfplumber_columnar(str(path))
+
+        # 按栏模式：左栏最后一行应在右栏第一行之前（证明左栏整体先于右栏提取）
+        left_gamma_idx = column_md.find("Left gamma")
+        right_alpha_idx = column_md.find("Right alpha")
+        self.assertGreater(left_gamma_idx, -1)
+        self.assertGreater(right_alpha_idx, -1)
+        self.assertLess(left_gamma_idx, right_alpha_idx)
+
+        # 按栏模式：同行左右文本不应被合并到一行
+        self.assertNotIn("Left alpha Right alpha", column_md)
+
+        # 逐行模式（对照组）：同 top 的左右文本会被合并到同一行，这正是新模式要解决的问题
+        self.assertIn("Left alpha Right alpha", linear_md)
+
 
 class RegressionTests(unittest.TestCase):
     def test_temporary_office_files_are_ignored(self):
